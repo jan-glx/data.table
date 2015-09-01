@@ -582,10 +582,8 @@ SEXP readfile(SEXP input, SEXP separg, SEXP nrowsarg, SEXP headerarg, SEXP nastr
     //   Auto detect eol, first eol where there are two (i.e. CRLF)
     // ********************************************************************************************
     ch = mmp;
-    while (ch<eof && *ch!='\n' && *ch!='\r') {
-        if (*ch=='\"') while(++ch<eof && *ch!='\"') {};  // allows protection of \n and \r inside column names
-        ch++;                                            // this 'if' needed in case opening protection is not closed before eof
-    }
+    sep = '\n'; eol='\r'; // Misuse sep and eol to use Field() for eol search
+    Field(1);
     if (ch>=eof) {
         if (ch>eof) STOP("Internal error: ch>eof when detecting eol");
         if (verbose) Rprintf("Input ends before any \\r or \\n observed. Input will be treated as a single data row.\n");
