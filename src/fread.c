@@ -70,7 +70,15 @@ static int fieldLen;
 #define NUT        8   // Number of User Types (just for colClasses where "numeric"/"double" are equivalent)
 static const char UserTypeName[NUT][10] = {"logical", "integer", "integer64", "numeric", "character", "NULL", "double", "CLASS" };  // important that first 6 correspond to TypeName.  "CLASS" is the fall back to character then as.class at R level ("CLASS" string is just a placeholder).
 static int UserTypeNameMap[NUT] = { SXP_LGL, SXP_INT, SXP_INT64, SXP_REAL, SXP_STR, SXP_NULL, SXP_REAL, SXP_STR };
+enum Quotemethod {kNoQuoting, kDouble, kBackslash};
+enum Quotemethod quoteMethod = kNoQuoting;
 
+size_t sbufSize = 64; // actually smalles size will be 128
+char * sbuf = NULL;
+char * chb = NULL;
+char * eob = NULL;
+  
+  
 const char *fnam=NULL, *mmp;
 size_t filesize;
 #ifdef WIN32
@@ -103,53 +111,68 @@ void STOP(const char *format, ...) {
     error(msg);
 }
 
+static inline void toBuf()
+{
+  if (chb>=eob) {
+    if (chb>eob) STOP("Internal Error: tied to write to string buffer behind behin its end");
+    char * newsbuf = realloc(sbuf, sbufSize=sbufSize*2);
+    if (!newsbuf) {
+      free(sbuf);
+      STOP("Realloc for string buffer (%i) failed",sbufSize);
+    }
+    sbuf = newsbuf;
+  }
+  *chb++=*ch;
+}
+
 static inline void Field(int err)
 {
-    if (*ch=='\"') { // protected, now look for the next ", so long as it doesn't leave unbalanced unquoted regions
-        fieldStart = ch+1;
-        int eolCount=0;  // just >0 is used currently but may as well count
-        Rboolean noEmbeddedEOL=FALSE, quoteProblem=FALSE;
-        while(++ch<eof) {
-            if (*ch!='\"') {
-                if (noEmbeddedEOL && *ch==eol) { quoteProblem=TRUE; break; }
-                eolCount+=(*ch==eol);
-                continue;  // fast return in most cases of characters
-            }
-            
-            if (ch+1==eof || *(ch+1)==sep || *(ch+1)==eol) break;
-            // " followed by sep|eol|eof dominates a field ending with \" (for support of Windows style paths)
-            
-            if (*(ch-1)!='\\') {
-                if (ch+1<eof && *(ch+1)=='\"') { ch++; continue; }  // skip doubled-quote
-                // unescaped subregion
-                if (eolCount) {ch++; quoteProblem=TRUE; break;}
-                while (++ch<eof && (*ch!='\"' || *(ch-1)=='\\') && *ch!=eol);
-                if (ch==eof || *ch==eol) {quoteProblem=TRUE; break;}
-                noEmbeddedEOL = 1;
-            }
+    if (sep==' ') {
+        while(ch<eof && *ch==sep) ch++;
+    }
+    switch (quoteMethod){
+    case kNoQuoting:
+      fieldStart = ch;
+      while(ch<eof && *ch!=sep && *ch!=eol) ch++;
+      fieldLen = (int)(ch-fieldStart);
+      break;
+    case kDouble:
+      fieldStart = sbuf;
+      chb = sbuf;
+      while(ch<eof && *ch!=sep && *ch!=eol) {
+        toBuf();
+        if (*ch++=='\"') {
+          do
+          {
+            if (ch==eof) STOP("File ended while searching for end of quote.");
+            toBuf();
+          } while (*ch++!='\"' || (ch<eof && *ch++=='\"'));
         }
-        if (quoteProblem || ch==eof) {
-            if (!err) {
-                fieldLen = -1; // so that countfields/separator testing knows line is invalid
-                return;
+      }
+      fieldLen = (int)(chb-sbuf);
+      break;
+    case kBackslash:
+      fieldStart = sbuf;
+      chb = sbuf;
+      while(ch<eof && *ch!=sep && *ch!=eol) {
+        toBuf();
+        if (*ch++=='\"') {
+          do
+          {
+            if (ch==eof) STOP("File ended while searching for end of quote.");
+            if (*ch=='\\'&& (ch+1)<eof && *(ch+1)=='\"') {
+              ch++;
             }
-            STOP("Field %d on line %d starts with quote (\") but then has a problem. It can contain balanced unescaped quoted subregions but if it does it can't contain embedded \\n as well. Check for unbalanced unescaped quotes: %.*s", field+1, line, ch-fieldStart+1, fieldStart-1);
+            toBuf();
+          } while (*ch++!='\"');
         }
-        fieldLen = (int)(ch-fieldStart);
-        ch++; // from closing quote to rest on sep|eol|eof
-    } else {           // unprotected, look for next next [sep|eol]
-        if (sep==' ') {
-            while(ch<eof && *ch==sep) ch++;
-            fieldStart = ch;
-            while(ch<eof && *ch!=sep && *ch!=eol) ch++;
-            fieldLen = (int)(ch-fieldStart);
-            while(ch<eof && *ch==sep) ch++;
-            if (ch<eof && *ch!=eol) ch--;  // leave on last space before new field's text
-        } else {
-            fieldStart = ch;
-            while(ch<eof && *ch!=sep && *ch!=eol) ch++;
-            fieldLen = (int)(ch-fieldStart);
-        }
+      }
+      fieldLen = (int)(chb-sbuf);
+      break;
+    }
+    if (sep==' ') {
+      while(ch<eof && *ch==sep) ch++;
+      if (ch<eof && *ch!=eol) ch--;  // leave on last space before new field's text
     }
     // Rprintf("Processed field %.*s\n", (int)(ch-fieldStart), fieldStart);
 }
