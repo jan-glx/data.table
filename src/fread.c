@@ -113,16 +113,16 @@ void STOP(const char *format, ...) {
 
 static inline void toBuf()
 {
-  if (chb>=eob) {
-    if (chb>eob) STOP("Internal Error: tied to write to string buffer behind behin its end");
-    char * newsbuf = realloc(sbuf, sbufSize=sbufSize*2);
-    if (!newsbuf) {
-      free(sbuf);
-      STOP("Realloc for string buffer (%i) failed",sbufSize);
+    if (chb>=eob) {
+        if (chb>eob) STOP("Internal Error: tied to write to string buffer behind behin its end");
+        char * newsbuf = realloc(sbuf, sbufSize=sbufSize*2);
+        if (!newsbuf) {
+            free(sbuf);
+            STOP("Realloc for string buffer (%i) failed",sbufSize);
+        }
+        sbuf = newsbuf;
     }
-    sbuf = newsbuf;
-  }
-  *chb++=*ch;
+    *chb++=*ch;
 }
 
 static inline void Field(int err)
@@ -132,47 +132,47 @@ static inline void Field(int err)
     }
     switch (quoteMethod){
     case kNoQuoting:
-      fieldStart = ch;
-      while(ch<eof && *ch!=sep && *ch!=eol) ch++;
-      fieldLen = (int)(ch-fieldStart);
-      break;
+        fieldStart = ch;
+        while(ch<eof && *ch!=sep && *ch!=eol) ch++;
+        fieldLen = (int)(ch-fieldStart);
+        break;
     case kDouble:
-      fieldStart = sbuf;
-      chb = sbuf;
-      while(ch<eof && *ch!=sep && *ch!=eol) {
-        toBuf();
-        if (*ch++=='\"') {
-          do
-          {
-            if (ch==eof) STOP("File ended while searching for end of quote.");
+        fieldStart = sbuf;
+        chb = sbuf;
+        while(ch<eof && *ch!=sep && *ch!=eol) {
             toBuf();
-          } while (*ch++!='\"' || (ch<eof && *ch++=='\"'));
-        }
-      }
-      fieldLen = (int)(chb-sbuf);
-      break;
-    case kBackslash:
-      fieldStart = sbuf;
-      chb = sbuf;
-      while(ch<eof && *ch!=sep && *ch!=eol) {
-        toBuf();
-        if (*ch++=='\"') {
-          do
-          {
-            if (ch==eof) STOP("File ended while searching for end of quote.");
-            if (*ch=='\\'&& (ch+1)<eof && *(ch+1)=='\"') {
-              ch++;
+            if (*ch++=='\"') {
+                do
+                {
+                    if (ch==eof) STOP("File ended while searching for end of quote.");
+                    toBuf();
+                } while (*ch++!='\"' || (ch<eof && *ch++=='\"'));
             }
-            toBuf();
-          } while (*ch++!='\"');
         }
-      }
-      fieldLen = (int)(chb-sbuf);
-      break;
+        fieldLen = (int)(chb-sbuf);
+        break;
+    case kBackslash:
+        fieldStart = sbuf;
+        chb = sbuf;
+        while(ch<eof && *ch!=sep && *ch!=eol) {
+            toBuf();
+            if (*ch++=='\"') {
+                do
+                {
+                    if (ch==eof) STOP("File ended while searching for end of quote.");
+                    if (*ch=='\\'&& (ch+1)<eof && *(ch+1)=='\"') {
+                        ch++;
+                    }
+                    toBuf();
+                } while (*ch++!='\"');
+            }
+        }
+        fieldLen = (int)(chb-sbuf);
+        break;
     }
     if (sep==' ') {
-      while(ch<eof && *ch==sep) ch++;
-      if (ch<eof && *ch!=eol) ch--;  // leave on last space before new field's text
+        while(ch<eof && *ch==sep) ch++;
+        if (ch<eof && *ch!=eol) ch--;  // leave on last space before new field's text
     }
     // Rprintf("Processed field %.*s\n", (int)(ch-fieldStart), fieldStart);
 }
@@ -757,22 +757,31 @@ SEXP readfile(SEXP input, SEXP separg, SEXP nrowsarg, SEXP headerarg, SEXP nastr
     SEXP names = PROTECT(allocVector(STRSXP, ncol));
     protecti++;
     allchar=TRUE;
+    const char * fieldStartH;
     for (i=0; i<ncol; i++) {
-        if (ch<eof && *ch=='\"') {
-            while(++ch<eof && (*ch!='\"' || (ch+1<eof && *(ch+1)!=sep && *(ch+1)!=eol))) {};
-            if (ch<eof && *ch++!='\"') STOP("Internal error: quoted field ends before EOF but not with \"sep");
-        } else {                              // if field reads as double ok then it's INT/INT64/REAL; i.e., not character (and so not a column name)
-            if (*ch!=sep && *ch!=eol && Strtod())  // blank column names (,,) considered character and will get default names
-                allchar=FALSE;                     // considered testing at least one isalpha, but we want 1E9 to be a value not a column name
-            else while(ch<eof && *ch!=eol && *ch!=sep) ch++;  // skip over unquoted character field
+        fieldStartH=ch;
+        if (ch>=eof || *ch==eol) { // => blank column name (e.g. "colname1,/n") or:
+          if (i<ncol-1) STOP("Unexpected end of file or line while reading column names.");
+        } else if (*ch!=sep && Strtod()) { // => not a blank column name (e.g. "colname1,,") && reads as double
+          // blank column names are considered character and will get default names
+          // if field reads as double ok then it's INT/INT64/REAL; i.e., not character (and so not a column name)
+          // considered testing at least one isalpha instead, but we want 1E9 to be a value not a column name
+          allchar=FALSE;
+          break;// no need to check further - we now "know" that this row contains data == is no header
         }
-        if (i<ncol-1) {   // not the last column (doesn't have a separator after it)
+        ch=fieldStartH;// reset no matter what 'Strtod()' did such that we can
+        Field(1);      // skip over potentially quoted character field
+        
+        //sanity checks:
+        if (i<ncol-1) {// not the last column
             if (ch<eof && *ch!=sep) STOP("Unexpected character ending field %d of line %d: %.*s", i+1, line, ch-pos+5, pos);
-            else if (ch<eof) ch++;
-        } 
+        } else {       // last column 
+            if (ch<eof && *ch!=eol) STOP("Not positioned correctly after testing format of header row. ch='%c'",*ch);
+        }
+        ch++; //move over sep to beginning of next field
     }
     // *** TO DO discard any whitespace after last column name on first row before the eol ***
-    if (ch<eof && *ch!=eol) STOP("Not positioned correctly after testing format of header row. ch='%c'",*ch);
+    ch = pos;   // back to start of first row 
     if (verbose && header!=NA_LOGICAL) Rprintf("'header' changed by user from 'auto' to %s\n", header?"TRUE":"FALSE");
     char buff[10]; // to construct default column names
     if (header==FALSE || (header==NA_LOGICAL && !allchar)) {
@@ -781,25 +790,27 @@ SEXP readfile(SEXP input, SEXP separg, SEXP nrowsarg, SEXP headerarg, SEXP nastr
             sprintf(buff,"V%d",i+1);
             SET_STRING_ELT(names, i, mkChar(buff));
         }
-        ch = pos;   // back to start of first row. Treat as first data row, no column names present.
+        // ch==pos -  Treat as first data row, no column names present.
     } else {
         if (verbose && header==NA_LOGICAL) Rprintf("All the fields on line %d are character fields. Treating as the column names.\n", line);
-        ch = pos;
         line++;
         for (i=0; i<ncol; i++) {
-            if (ch<eof && *ch=='\"') {ch++; ch2=ch; while(ch2<eof && (*ch2!='\"' || (ch2+1<eof && *(ch2+1)!=sep && *(ch2+1)!=eol))) ch2++;}
-            else {ch2=ch; while(ch2<eof && *ch2!=sep && *ch2!=eol) ch2++;}
-            if (ch2>ch) {
-                SET_STRING_ELT(names, i, mkCharLen(ch, (int)(ch2-ch)));
+            Field(1); // read poteinial quoted field 
+            if (fieldLen>0) {
+                SET_STRING_ELT(names, i, mkCharLen(fieldStart, fieldLen));
             } else {
                 sprintf(buff,"V%d",i+1);
                 SET_STRING_ELT(names, i, mkChar(buff));
             }
-            if (ch2<eof && *ch2=='\"') ch2++;
-            if (i<ncol-1) ch=++ch2;
-        }
-        while (ch<eof && *ch!=eol) ch++;
-        if (ch<eof && *ch==eol) ch+=eolLen;  // now on first data row (row after column names)
+            //sanity checks and sep or eol skipping
+            if (i<ncol-1) {// not the last column
+              if (ch<eof && *ch!=sep) STOP("Unexpected character ending field %d of line %d: %.*s", i+1, line, ch-pos+5, pos);
+              ch++; //move over sep to beginning of next field
+            } else {       // last column 
+              if (ch<eof && *ch!=eol) STOP("Not positioned correctly after testing format of header row. ch='%c'",*ch);
+              ch+=eolLen;  // move over eol to beginning of first data row (row after column names)
+            }
+        } 
         pos = ch;
     }
     clock_t tLayout = clock();
