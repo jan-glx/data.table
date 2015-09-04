@@ -70,8 +70,17 @@ static int fieldLen;
 #define NUT        8   // Number of User Types (just for colClasses where "numeric"/"double" are equivalent)
 static const char UserTypeName[NUT][10] = {"logical", "integer", "integer64", "numeric", "character", "NULL", "double", "CLASS" };  // important that first 6 correspond to TypeName.  "CLASS" is the fall back to character then as.class at R level ("CLASS" string is just a placeholder).
 static int UserTypeNameMap[NUT] = { SXP_LGL, SXP_INT, SXP_INT64, SXP_REAL, SXP_STR, SXP_NULL, SXP_REAL, SXP_STR };
-enum Quotemethod {kNoQuoting, kDouble, kBackslash};
-enum Quotemethod quoteMethod = kNoQuoting;
+enum Quotemethod {kDoubleNoUnquoting, kBackslashNoUnquoting, kNoQuoting, kDoubleUnquoting, kBackslashUnquoting};
+static const char *QUOTE_METHOD[] = {
+  "quoted, double escaped", "quoted, backslash escaped", "unquoted", "quoted, double escaped, unquoting", "quoted, backslash escaped, unquoting"
+};
+enum Quotemethod quoteMethodsToFindEol[] = {kDoubleNoUnquoting, kBackslashNoUnquoting, kNoQuoting};
+enum Quotemethod quoteMethodsToFindSep[] = {kDoubleUnquoting, kBackslashUnquoting, kDoubleNoUnquoting, kBackslashNoUnquoting, kNoQuoting};
+enum Quotemethod quoteMethod = -1;
+int quoteMethodPossible[] = {1,1,1,1,1};
+char eolQm[5];
+char eol2Qm[5];
+int eolLenQm[5];
 
 size_t sbufSize = 64; // actually smalles size will be 128
 char * sbuf = NULL;
@@ -125,48 +134,111 @@ static inline void toBuf()
     *chb++=*ch;
 }
 
+static inline int checkEolInQuoted(int err)
+{
+    if (ch>=eof) {
+        if (ch==eof) { 
+            if (err) STOP("File ended while searching for end of quote.");
+        } else STOP("Internal Error: Somehow got behind end of file while searching for end of quote.");
+        fieldLen = -1;
+        return 1;
+    }
+    return 0;
+}
+static inline int checkQuoteEnd(int err)
+{
+    if (ch<eof && *ch!=sep && *ch!=eol) { // quoted region does not end at end of field
+        if (err) STOP("End of quote is not end of field");
+        fieldLen = -1;
+        return 1; 
+    } else if (ch>eof) STOP("Internal error: Somehow got behind end of file after search for end of quote.");
+    return 0; // otherwise we are fine (field endend with eof)
+}
+static inline int checkStartsWithQuote(int err)
+{
+    if (*ch!='\"') {
+        if (err) STOP("Field does not start with a double quote");
+        fieldLen = -1;
+        return 1;
+    }
+    return 0;// it propably is a quoted field
+}
+static inline void skipIfEscaping(int err)
+{
+    // all original`\` must have been replaced by `\\` to avoid ambigouty in:
+    //`\"` (is this a `\` followed by a quote ending `"` or is it an escaped `"`)
+    if (*ch=='\\'&& (ch+1)<eof) {
+        if(*(ch+1)=='\"'||*(ch+1)=='\"') ch++;
+        else if (err) warning("unknown escape sequence: %c%c",*ch, *(ch+1));// TODO: print it
+    }
+}
+
 static inline void Field(int err)
 {
     if (sep==' ') {
         while(ch<eof && *ch==sep) ch++;
     }
+    fieldStart = ch;
     switch (quoteMethod){
     case kNoQuoting:
-        fieldStart = ch;
         while(ch<eof && *ch!=sep && *ch!=eol) ch++;
         fieldLen = (int)(ch-fieldStart);
         break;
-    case kDouble:
-        fieldStart = sbuf;
-        chb = sbuf;
+    case kDoubleNoUnquoting:
+        //Rprintf("\n Field start: ");
         while(ch<eof && *ch!=sep && *ch!=eol) {
-            toBuf();
+            //Rprintf("-%c-",*ch);
             if (*ch++=='\"') {
                 do
                 {
-                    if (ch==eof) STOP("File ended while searching for end of quote.");
-                    toBuf();
-                } while (*ch++!='\"' || (ch<eof && *ch++=='\"'));
+                    if (checkEolInQuoted(err)) return;
+                    //Rprintf("_%c_",*ch);
+                } while (*ch++!='\"' || (ch<eof && *ch=='\"' && ch++));
             }
         }
-        fieldLen = (int)(chb-sbuf);
+        fieldLen = (int)(ch-fieldStart);
+        //Rprintf(" :end (fieldLength:%i)\n",fieldLen);
         break;
-    case kBackslash:
-        fieldStart = sbuf;
-        chb = sbuf;
+    case kBackslashNoUnquoting:
+        // this allows to read unescaped JSON string fields for example (with a compatible `sep`)
         while(ch<eof && *ch!=sep && *ch!=eol) {
-            toBuf();
             if (*ch++=='\"') {
                 do
                 {
-                    if (ch==eof) STOP("File ended while searching for end of quote.");
-                    if (*ch=='\\'&& (ch+1)<eof && *(ch+1)=='\"') {
-                        ch++;
-                    }
-                    toBuf();
+                    if (checkEolInQuoted(err)) return;
+                    skipIfEscaping(err);
                 } while (*ch++!='\"');
             }
         }
+        fieldLen = (int)(fieldStart-ch);
+        break;
+    case kDoubleUnquoting: // should be the standard case (see https://tools.ietf.org/html/rfc4180)
+        chb = sbuf;
+        if(ch<eof && *ch!=sep && *ch!=eol){ // it's not an empty field
+            if (checkStartsWithQuote(err)) return;
+            ch++;
+            do {
+                if (checkEolInQuoted(err)) return;
+                toBuf();
+            } while (*ch++!='\"'|| (ch<eof && *ch=='\"'&& ch++));
+            if (checkQuoteEnd(err)) return;
+        }
+        fieldStart = sbuf;
+        fieldLen = (int)(chb-sbuf);
+        break;
+    case kBackslashUnquoting:// discuraged
+        chb = sbuf;
+        if(ch<eof && *ch!=sep && *ch!=eol){ // it's not an empty field
+            if (checkStartsWithQuote(err)) return;
+            ch++;
+            do {
+                if (checkEolInQuoted(err)) return;
+                skipIfEscaping(err);
+                toBuf(); // bc skipIfEscaping only second char of `\\` or `\"` gets copied
+            } while (*ch++!='\"');
+            if (checkQuoteEnd(err)) return;
+        }
+        fieldStart = sbuf;
         fieldLen = (int)(chb-sbuf);
         break;
     }
@@ -191,7 +263,7 @@ static int countfields()
             return -1;                       // see test 1010
         }  
         if (ch==eof || *ch==eol) {
-            if (ch<eof) ch+=eolLen;          // move ch to the start of the next line
+            ch+=eolLen; if (ch>eof) ch=eof;// move ch to the start of the next line
             return ncol;
         }
         if (*ch!=sep) STOP("Internal error: Field() has ended with '%c' not sep='%c'", *ch, sep);
@@ -583,32 +655,42 @@ SEXP readfile(SEXP input, SEXP separg, SEXP nrowsarg, SEXP headerarg, SEXP nastr
     // ********************************************************************************************
     ch = mmp;
     sep = '\n'; eol='\r'; // Misuse sep and eol to use Field() for eol search
-    Field(1);
-    if (ch>=eof) {
-        if (ch>eof) STOP("Internal error: ch>eof when detecting eol");
-        if (verbose) Rprintf("Input ends before any \\r or \\n observed. Input will be treated as a single data row.\n");
-        eol=eol2='\n'; eolLen=1;
-    } else {
-        eol=eol2=*ch; eolLen=1;
-        if (eol=='\r') {
-            if (ch+1<eof && *(ch+1)=='\n') {
-                if (verbose) Rprintf("Detected eol as \\r\\n (CRLF) in that order, the Windows standard.\n");
-                eol2='\n'; eolLen=2;
-            } else {
-                if (ch+1<eof && *(ch+1)=='\r')
-                    STOP("Line ending is \\r\\r\\n. R's download.file() appears to add the extra \\r in text mode on Windows. Please download again in binary mode (mode='wb') which might be faster too. Alternatively, pass the URL directly to fread and it will download the file in binary mode for you.");
+    for (int i = 0; i < sizeof(quoteMethodsToFindEol)/sizeof(enum Quotemethod); i++){
+        int qm = quoteMethodsToFindEol[i];
+        ch = mmp;
+        if (!quoteMethodPossible[qm]) continue;
+        if (verbose) Rprintf("Searching eol for quotemethod '%s':\n",QUOTE_METHOD[qm]);
+        quoteMethod = qm;
+        Field(0);
+        if (fieldLen==-1) {quoteMethodPossible[qm] = 0; continue;}
+        if (ch>=eof) {
+            if (ch>eof) STOP("Internal error: ch>eof when detecting eol");
+            if (verbose) Rprintf("Input ends before any \\r or \\n observed. Input will be treated as a single data row.\n");
+            eol=eol2='\n'; eolLen=1;
+        } else {
+            eol=eol2=*ch; eolLen=1;
+            if (eol=='\r') {
+                if (ch+1<eof && *(ch+1)=='\n') {
+                    if (verbose) Rprintf("Detected eol as \\r\\n (CRLF) in that order, the Windows standard.\n");
+                    eol2='\n'; eolLen=2;
+                } else {
+                    if (ch+1<eof && *(ch+1)=='\r')
+                        STOP("Line ending is \\r\\r\\n. R's download.file() appears to add the extra \\r in text mode on Windows. Please download again in binary mode (mode='wb') which might be faster too. Alternatively, pass the URL directly to fread and it will download the file in binary mode for you.");
                     // NB: on Windows, download.file from file: seems to condense \r\r too. So 
-                if (verbose) Rprintf("Detected eol as \\r only (no \\n or \\r afterwards). An old Mac 9 standard, discontinued in 2002 according to Wikipedia.\n");
-            }
-        } else if (eol=='\n') {
-            if (ch+1<eof && *(ch+1)=='\r') {
-                warning("Detected eol as \\n\\r, a highly unusual line ending. According to Wikipedia the Acorn BBC used this. If it is intended that the first column on the next row is a character column where the first character of the field value is \\r (why?) then the first column should start with a quote (i.e. 'protected'). Proceeding with attempt to read the file.\n");
-                eol2='\r'; eolLen=2;
-            } else if (verbose) Rprintf("Detected eol as \\n only (no \\r afterwards), the UNIX and Mac standard.\n");
-        } else
-            STOP("Internal error: if no \\r or \\n found then ch should be eof");
+                    if (verbose) Rprintf("Detected eol as \\r only (no \\n or \\r afterwards). An old Mac 9 standard, discontinued in 2002 according to Wikipedia.\n");
+                }
+            } else if (eol=='\n') {
+                if (ch+1<eof && *(ch+1)=='\r') {
+                    warning("Detected eol as \\n\\r, a highly unusual line ending. According to Wikipedia the Acorn BBC used this. If it is intended that the first column on the next row is a character column where the first character of the field value is \\r (why?) then the first column should start with a quote (i.e. 'protected'). Proceeding with attempt to read the file.\n");
+                    eol2='\r'; eolLen=2;
+                } else if (verbose) Rprintf("Detected eol as \\n only (no \\r afterwards), the UNIX and Mac standard.\n");
+            } else
+                STOP("Internal error: if no \\r or \\n found then ch should be eof");
+        }
+        eolQm[qm]=eol;
+        eol2Qm[qm]=eol2;
+        eolLenQm[qm]=eolLen;
     }
-
     // ********************************************************************************************
     //   Position to line skip+1 or line containing skip="string" or line autostart
     // ********************************************************************************************
@@ -629,7 +711,7 @@ SEXP readfile(SEXP input, SEXP separg, SEXP nrowsarg, SEXP headerarg, SEXP nastr
         tmp = tmp>0 ? tmp+1 : INTEGER(autostart)[0];
         while (ch<eof && line<tmp) {
             while (ch<eof && *ch!=eol) ch++;
-            if (ch<eof) ch+=eolLen;
+            ch+=eolLen; if (ch>eof) ch=eof; // move to begining of next line and back to eof file 
             line++;
         }
         pos = ch;
@@ -647,7 +729,7 @@ SEXP readfile(SEXP input, SEXP separg, SEXP nrowsarg, SEXP headerarg, SEXP nastr
                 if (ch<eof && *ch==eol) { line++; ch+=eolLen; pos=ch; }
                 else break;
             }
-            if (ch==eof) STOP("Input is either empty or fully whitespace after the skip or autostart. Run again with verbose=TRUE.");
+            if (ch>=eof) STOP("Input is either empty or fully whitespace after the skip or autostart. Run again with verbose=TRUE.");
             if (verbose) Rprintf("line %d\n", line);
         } else {
             if (verbose) Rprintf("This line is the autostart and not blank so searching up for the last non-blank ... ");
@@ -674,7 +756,7 @@ SEXP readfile(SEXP input, SEXP separg, SEXP nrowsarg, SEXP headerarg, SEXP nastr
     // ********************************************************************************************
     const char *seps;
     if (isNull(separg)) {
-        seps=",\t |;:";  // separators, in order of preference. See ?fread. (colon last as it can appear in time fields)
+        seps="\t";//",\t |;:";  // separators, in order of preference. See ?fread. (colon last as it can appear in time fields)
         if (verbose) Rprintf("Detecting sep ... ");
     } else {
         seps = (const char *)CHAR(STRING_ELT(separg,0));  // length 1 string of 1 character, checked above
@@ -685,7 +767,16 @@ SEXP readfile(SEXP input, SEXP separg, SEXP nrowsarg, SEXP headerarg, SEXP nastr
     const char *topStart=ch, *thisStart=ch;
     char topSep=seps[0];
     int topLine=0, topLen=0, topNcol=-1;
-    for (int s=0; s<nseps; s++) {
+    enum Quotemethod topQuoteMethod;
+    for (int j = 0; j < sizeof(quoteMethodsToFindSep)/sizeof(enum Quotemethod); j++){
+      int qm = quoteMethodsToFindSep[j];
+      if (!quoteMethodPossible[qm]) {Rprintf("\n\n\nskipped: '%s':\n",QUOTE_METHOD[qm]);continue;}
+      quoteMethod = qm;
+      Rprintf("\n\n\n=================%i============Quote method: '%s':\n",j,QUOTE_METHOD[qm]);
+      eol=eolQm[qm];
+      eol2=eol2Qm[qm];
+      eolLen=eolLenQm[qm];
+      for (int s=0; s<nseps; s++) {
         if (seps[s] == decChar) continue;
         ch=pos; sep=seps[s];
         i=0;
@@ -693,29 +784,36 @@ SEXP readfile(SEXP input, SEXP separg, SEXP nrowsarg, SEXP headerarg, SEXP nastr
         while(ch<=eof && ++i<=30) {
             lineStart = ch;
             ncol = countfields();
+          if (ch<eof) Rprintf("\nlineStart=%c,current:%c,ncol:%i,sep=%c",*lineStart,*ch,ncol,sep);
+          else if(lineStart<eof) Rprintf("\nlineStart=%c,ncol:%i,sep=%c",*lineStart,ncol,sep);
+          else Rprintf("\nlineStart==eof");
             if (ncol==-1) {
                 if (thisNcol==-1) break;  // if first row has quote problem, move straight on to test a different sep
-                ncol=thisNcol;   // skip the quote problem row for now (consider part of current run)
+            //=thisNcol;   // skip the quote problem row for now (consider part of current run)
             }
             if (ncol==thisNcol) thisLen++;
             if (ch==eof || i==30 || ncol!=thisNcol) {
                 // this* still refers to the previous run which has just finished
-                // Rprintf("\nRun: s='%c' thisLine=%d thisLen=%d thisNcol=%d", sep, thisLine, thisLen, thisNcol);
-                if (thisNcol>1 && (thisLen>topLen ||     // longest run wins
-                                   (thisLen==topLen && sep==topSep && thisNcol>topNcol))) {  // if tied, the one that divides it more (test 1328, 2 rows)
-                    topStart = thisStart;
-                    topLine = thisLine;
-                    topLen = thisLen;
-                    topNcol = thisNcol;
-                    topSep = sep;
-                }
-                if (lineStart==eof) break;
-                thisStart = lineStart;
-                thisLine = line+i-1;
-                thisLen = 1;
-                thisNcol = ncol;
+            //Rprintf("\nRun: qm=%i s='%c' thisLine=%d thisLen=%d thisNcol=%d", qm, sep, thisLine, thisLen, thisNcol);
+            if (thisNcol>1 && (thisLen>topLen ||     // longest run wins
+                (thisLen==topLen && sep==topSep && thisNcol>topNcol))) {  // if tied, the one that divides it more (test 1328, 2 rows)
+              topStart = thisStart;
+              topLine = thisLine;
+              topLen = thisLen;
+              topNcol = thisNcol;
+              topSep = sep;
+              topQuoteMethod = quoteMethod;
             }
+            if (lineStart==eof) break;
+            thisStart = lineStart;
+            thisLine = line+i-1;
+            thisLen = 1;
+            thisNcol = ncol;
+          }
         }
+        
+        Rprintf("\n========================qm=%i s='%c' thisLine=%d thisLen=%d thisNcol=%d\n", qm, sep, thisLine, thisLen, thisNcol);
+      }
     }
     if (topNcol<2) {
         if (verbose) Rprintf("Deducing this is a single column input.\n");
@@ -728,9 +826,14 @@ SEXP readfile(SEXP input, SEXP separg, SEXP nrowsarg, SEXP headerarg, SEXP nastr
         ch=pos=topStart;
         line=topLine;
         ncol=topNcol;
+      quoteMethod = topQuoteMethod;
+      eol=eolQm[topQuoteMethod];
+      eol2=eol2Qm[topQuoteMethod];
+      eolLen=eolLenQm[topQuoteMethod];
         if (verbose) {
             if (isNull(separg)) { if (sep=='\t') Rprintf("'\\t'\n"); else Rprintf("'%c'\n", sep); }
             else Rprintf("found ok\n");
+        Rprintf("Detected quote method: '%s'\n",QUOTE_METHOD[quoteMethod]);
         } 
     }
     if (verbose) {
@@ -751,6 +854,7 @@ SEXP readfile(SEXP input, SEXP separg, SEXP nrowsarg, SEXP headerarg, SEXP nastr
     }
     if (ch!=pos) STOP("Internal error. ch!=pos after sep detection");
     
+    STOP("yes");
     // ********************************************************************************************
     //   Detect and assign column names (if present)
     // ********************************************************************************************
