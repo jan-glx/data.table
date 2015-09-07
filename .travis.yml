@@ -8,6 +8,9 @@
 # Thanks to csgillespie for https://github.com/csgillespie/travis-examples/tree/master/bioconductor
 language: c
 
+# see http://docs.travis-ci.com/user/workers/container-based-infrastructure/
+sudo: required 
+
 before_install:
   - curl -OL http://raw.github.com/craigcitro/r-travis/master/scripts/travis-tool.sh
   - chmod 755 ./travis-tool.sh
