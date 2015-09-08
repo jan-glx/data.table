@@ -1,0 +1,3 @@
+json1	string1
+{"f1":"value1","f2":"double quote escaped with a backslash [ \" ]"}	"string field"
+{"f1":"value3","f2":"backslash escaped with a backslash [ \\ ]"}	"spring field"
