@@ -81,6 +81,7 @@ int quoteMethodPossible[] = {1,1,1,1,1};
 char eolQm[5];
 char eol2Qm[5];
 int eolLenQm[5];
+#define MAX_HASH_VAL    7 //'%%'(strtoi(charToRaw(",\t |;:"),16L),17)
 
 size_t sbufSize = 64; // actually smalles size will be 128
 char * sbuf = NULL;
@@ -508,6 +509,17 @@ static SEXP coerceVectorSoFar(SEXP v, int oldtype, int newtype, R_len_t sofar, R
     return(newv);
 }
 
+static void inline setEol(char * eol, int * eolLen, char * eol2, int isEol, int cnCol[], int nCol[])
+// simple saves the the found current eol
+{
+    *eol    = *(ch-1);  
+    *eolLen = isEol? 2 : 1;  
+    *eol2   = isEol? *ch : *(ch-1);
+    for (size_t i = 1; i<MAX_HASH_VAL; i++){ // zero not interesting
+        nCol[i] = cnCol[i];
+    }
+}
+
 SEXP readfile(SEXP input, SEXP separg, SEXP nrowsarg, SEXP headerarg, SEXP nastrings, SEXP verbosearg, SEXP autostart, SEXP skip, SEXP select, SEXP drop, SEXP colClasses, SEXP integer64, SEXP dec, SEXP encoding, SEXP showProgressArg)
 // can't be named fread here because that's already a C function (from which the R level fread function took its name)
 {
@@ -654,6 +666,179 @@ SEXP readfile(SEXP input, SEXP separg, SEXP nrowsarg, SEXP headerarg, SEXP nastr
     //   Auto detect eol, first eol where there are two (i.e. CRLF)
     // ********************************************************************************************
     ch = mmp;
+    
+    // ********************************************************************************************
+    //   Position to line containing skip="string" if set (ignoring all quoting what so ever)
+    // ********************************************************************************************
+    line = 1; pos = mmp;
+    // line is for error and warning messages so considers embedded \n, just like wc -l, head -n and tail -n
+    if (isString(skip)) {
+        ch = strstr(mmp, CHAR(STRING_ELT(skip,0)));
+        if (!ch) STOP("skip='%s' not found in input (it is case sensitive and literal; i.e., no patterns, wildcards or regex)", CHAR(STRING_ELT(skip,0)));
+        while (ch>mmp && *(ch-1)!='\n' &&*(ch-1)!='\r') ch--;  // move to beginning of line
+        pos = ch;
+        ch = mmp;
+        while (ch<pos) line+=(*ch++=='\n'); // I understand that all line endings contain that char once
+        if (verbose) Rprintf("Found skip='%s' at char line %d.\n", CHAR(STRING_ELT(skip,0)), line);
+        ch = pos;
+    } 
+    
+    
+    if (!isString(skip)) {
+        ch = mmp;
+        int tmp = INTEGER(skip)[0];
+        tmp = tmp>0 ? tmp+1 : INTEGER(autostart)[0];
+        while (ch<eof && line<tmp) {
+            while (ch<eof && *ch!=eol) ch++;
+            ch+=eolLen; if (ch>eof) ch=eof; // move to begining of next line and back to eof if there was none 
+            line++;
+        }
+        pos = ch;
+        if (verbose) Rprintf("Positioned on line %d after skip or autostart\n", line);
+        
+        while (ch<eof && isspace(*ch) && *ch!=eol) ch++;
+        Rboolean thisLineBlank = (ch==eof || *ch==eol);
+        ch = pos;
+        if (INTEGER(skip)[0]>0 && !thisLineBlank) {
+            if (verbose) Rprintf("This line isn't blank and skip>0 so we're done\n");
+        } else if (thisLineBlank) {
+            if (verbose) Rprintf("This line is blank. Moving to the next non-blank ... ");
+            while (ch<eof) {
+                while (ch<eof && isspace(*ch) && *ch!=eol) ch++;
+                if (ch<eof && *ch==eol) { line++; ch+=eolLen; pos=ch; }
+                else break;
+            }
+            if (ch>=eof) STOP("Input is either empty or fully whitespace after the skip or autostart. Run again with verbose=TRUE.");
+            if (verbose) Rprintf("line %d\n", line);
+        } else {
+            if (verbose) Rprintf("This line is the autostart and not blank so searching up for the last non-blank ... ");
+            // 'autostart' = select-sub-table-using-line-within
+            line++;
+            while (ch>=mmp && !thisLineBlank) {
+                pos = ch;
+                line--;
+                ch -= eolLen+1;
+                i = 0;
+                while (ch>=mmp && *ch!=eol2) { i+=!isspace(*ch); ch--; }
+                ch++;
+                thisLineBlank = i==0;
+            }
+            ch = pos;
+            if (verbose) Rprintf("line %d\n", line);
+        }
+    }
+    if (pos>mmp && *(pos-1)!=eol2) STOP("Internal error. No eol2 immediately before line %d, '%.1s' instead", line, pos-1);
+    
+    
+    
+    
+    
+    
+    int firstDataRow = INTEGER(skip)[0];
+    firstDataRow = firstDataRow>0 ? firstDataRow+1 : INTEGER(autostart)[0];
+    
+    // ********************************************************************************************
+    //   Find eol, sep and quote method
+    // ********************************************************************************************
+    const char *seps;
+    if (isNull(separg)) {
+        seps=",\t |;:";  // separators, in order of preference. See ?fread. (colon last as it can appear in time fields)
+        if (verbose) Rprintf("Detecting sep ... ");
+    } else {
+        seps = (const char *)CHAR(STRING_ELT(separg,0));  // length 1 string of 1 character, checked above
+        if (verbose) Rprintf("Using supplied sep '%s' ... ", seps[0]=='\t'?"\\t":seps);
+    }
+    const unsigned char *useps = (unsigned char*)seps;
+    int nseps = strlen(seps);
+    if (nseps+1 > MAX_HASH_VAL) STOP("Oh, we didn't expect anyone would want to to check for %i seps (%s). There is a hardcoded limit \"#define MAX_HASH_VAL %i //max nseps +1\" in fread.c. Increasing it would make fread slower. Let us know if you need it.", nseps, seps, MAX_HASH_VAL);
+    
+    int isQuotedDoubleEscape = 0, isQuotedIfBsEscape = 0, wasEscapingBs = 0, wasEol = 0;
+    int numberBsEscapedQuotes = 0, numberOfBadBsEscapes = 0;
+    
+    char eol = 0, eolDouble = 0,eolBs = 0,eol2 = 0,eol2Double = 0, eol2Bs = 0;
+    int eolLen = 0, eolLenDouble = 0, eolLenBs = 0;
+    int newRow = 0, newRowDouble = 0, newRowBs = 0;
+    
+    int nrows = 0, nrowsDouble = 0, nrowsBs = 0;
+    
+
+    size_t lookuptable[256] = {0};
+    for (size_t i = 0; i<nseps; i++)
+        lookuptable[useps[i]] = i+1;
+ /* lookuptable[ 44] = 1; //,
+    lookuptable[  9] = 2; //\t
+    lookuptable[ 32] = 3; // (space)
+    lookuptable[124] = 4; //|
+    lookuptable[ 59] = 5; //;
+    lookuptable[ 58] = 6; //: */
+    // it is named nCol but it is actually nCol-1
+    int  nCol[MAX_HASH_VAL]={0},  nColDouble[MAX_HASH_VAL]={0},  nColBs[MAX_HASH_VAL]={0}; // ncol-1 of first row
+    int nnCol[MAX_HASH_VAL]={0}, nnColDouble[MAX_HASH_VAL]={0}, nnColBs[MAX_HASH_VAL]={0}; // how often was current == nCol at eol
+    int cnCol[MAX_HASH_VAL]={0}, cnColDouble[MAX_HASH_VAL]={0}, cnColBs[MAX_HASH_VAL]={0}; // current ncol-1
+    
+    while(ch<eof) {// we could stop earlier and count the rows in a smaller loop
+        int isQuote = *ch=='\"';
+        int isBs = *ch=='\\';
+        int isEol = *ch=='\n' || *ch=='\r';
+        isQuotedDoubleEscape ^= isQuote;// that was easy (double double-quote unquotes and quotes again)
+        isQuotedIfBsEscape ^= isQuote && !wasEscapingBs;
+        numberBsEscapedQuotes += isQuote && wasEscapingBs;
+        numberOfBadBsEscapes += wasEscapingBs && !(isQuote || isBs);
+        //incerement seperator counts of current row:
+        size_t chHash = lookuptable[(unsigned char) *ch];
+        cnCol[chHash]++;
+        cnColDouble[chHash]++;
+        cnColDouble[chHash]++;
+        // I don't know anything about branching, but I would expect this to be faster than checking 
+        // wasEol first (!eolLen evaluates from the second line on as false):
+        if (!eolLen       && wasEol                         ) 
+            setEol(&eol,       &eolLen,       &eol2,       isEol, cnCol,       nCol);
+        if (!eolLenDouble && wasEol && !isQuotedDoubleEscape) 
+            setEol(&eolDouble, &eolLenDouble, &eol2Double, isEol, cnColDouble, nColDouble);
+        if (!eolLenBs     && wasEol && !isQuotedIfBsEscape  ) 
+            setEol(&eolBs,     &eolLenBs,     &eol2Bs,     isEol, cnColBs,     nColBs);
+        
+        //counting number of rows:
+        newRow       = ch==eof-1 || (wasEol &&                          (eolLen==1 || (isEol && !newRow      )));                                
+        newRowDouble = ch==eof-1 || (wasEol && !isQuotedDoubleEscape && (eolLen==1 || (isEol && !newRowDouble))); 
+        newRowBs     = ch==eof-1 || (wasEol && !isQuotedIfBsEscape   && (eolLen==1 || (isEol && !newRowBs    )));
+        nrows       += newRow;
+        nrowsDouble += newRowDouble;
+        nrowsBs     += newRowBs;
+        
+        for (size_t i = 0; i< MAX_HASH_VAL; i++){ // will the compiler optimize this away?
+            nnCol[i]       += newRow       && (nCol[i]      ==cnCol[i]); // increment if col count matches first row
+            nnColDouble[i] += newRowDouble && (nColDouble[i]==cnColDouble[i]); 
+            nnColBs[i]     += newRowBs     && (nColBs[i]    ==cnColBs[i]); 
+            
+            cnCol[i]       &= ~-newRow; // if newRow==1 then all bits of -newRow are set otherwise none => resets cnCol if newRow
+            cnColDouble[i] &= ~-newRowDouble;
+            cnColBs[i]     &= ~-newRowBs; 
+        }
+        
+        wasEscapingBs ^= (isQuotedIfBsEscape && isBs);
+        wasEol = isEol;
+        ch++;
+    }
+    
+    Rprintf("#rows/cols found per sep (nspes=%i):\n", nseps);
+    Rprintf("No quoting - %i rows:\n", nrows);
+    for (int i = 0; i < nseps; i++) Rprintf("%i rows with %i columns with sep '%c'\n",  nnCol[i+1],       nCol[i+1]+1,       seps[i]);
+    Rprintf("Double Esc - %i rows:\n", nrowsDouble);
+    for (int i = 0; i < nseps; i++) Rprintf("%i rows with %i columns with sep '%c'\n",  nnColDouble[i+1], nColDouble[i+1]+1, seps[i]);
+    Rprintf("Bcksls Esc - %i rows:\n", nrowsBs);
+    for (int i = 0; i < nseps; i++) Rprintf("%i rows with %i columns with sep '%c'\n",  nnColBs[i+1],     nColBs[i+1]+1,     seps[i]);
+    
+    STOP("yes");
+    
+    
+    
+    
+    
+    
+    
+    
+    
     sep = '\n'; eol='\r'; // Misuse sep and eol to use Field() for eol search
     for (int i = 0; i < sizeof(quoteMethodsToFindEol)/sizeof(enum Quotemethod); i++){
         int qm = quoteMethodsToFindEol[i];
@@ -711,7 +896,7 @@ SEXP readfile(SEXP input, SEXP separg, SEXP nrowsarg, SEXP headerarg, SEXP nastr
         tmp = tmp>0 ? tmp+1 : INTEGER(autostart)[0];
         while (ch<eof && line<tmp) {
             while (ch<eof && *ch!=eol) ch++;
-            ch+=eolLen; if (ch>eof) ch=eof; // move to begining of next line and back to eof file 
+            ch+=eolLen; if (ch>eof) ch=eof; // move to begining of next line and back to eof if there was none 
             line++;
         }
         pos = ch;
@@ -754,15 +939,7 @@ SEXP readfile(SEXP input, SEXP separg, SEXP nrowsarg, SEXP headerarg, SEXP nastr
     // ********************************************************************************************
     //   Auto detect separator, number of fields, and location of first row
     // ********************************************************************************************
-    const char *seps;
-    if (isNull(separg)) {
-        seps="\t";//",\t |;:";  // separators, in order of preference. See ?fread. (colon last as it can appear in time fields)
-        if (verbose) Rprintf("Detecting sep ... ");
-    } else {
-        seps = (const char *)CHAR(STRING_ELT(separg,0));  // length 1 string of 1 character, checked above
-        if (verbose) Rprintf("Using supplied sep '%s' ... ", seps[0]=='\t'?"\\t":seps);
-    }
-    int nseps = strlen(seps);
+
     
     const char *topStart=ch, *thisStart=ch;
     char topSep=seps[0];
@@ -854,7 +1031,7 @@ SEXP readfile(SEXP input, SEXP separg, SEXP nrowsarg, SEXP headerarg, SEXP nastr
     }
     if (ch!=pos) STOP("Internal error. ch!=pos after sep detection");
     
-    STOP("yes");
+    
     // ********************************************************************************************
     //   Detect and assign column names (if present)
     // ********************************************************************************************
